@@ -33,6 +33,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BooleanSupplier;
 import java.util.function.Predicate;
@@ -62,7 +63,7 @@ import org.slf4j.LoggerFactory;
 import net.openhft.chronicle.core.util.ThrowingSupplier;
 import org.apache.cassandra.cache.AutoSavingCache;
 import org.apache.cassandra.concurrent.ExecutorFactory;
-import org.apache.cassandra.concurrent.WrappedExecutorPlus;
+import org.apache.cassandra.concurrent.ExecutorPlus;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
@@ -112,6 +113,7 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.WithResources;
 import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.WrappedRunnable;
 import org.apache.cassandra.utils.concurrent.Future;
@@ -2012,10 +2014,10 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         return thread.getThreadGroup().getParent() == compactionThreadGroup;
     }
 
-    // TODO: this is a bit ugly, but no uglier than it was
-    static class CompactionExecutor extends WrappedExecutorPlus
+    static class CompactionExecutor implements ExecutorPlus
     {
         static final ThreadGroup compactionThreadGroup = executorFactory().newThreadGroup("compaction");
+        protected final ExecutorPlus executor;
 
         public CompactionExecutor()
         {
@@ -2029,11 +2031,12 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
         protected CompactionExecutor(ExecutorFactory executorFactory, int threads, String name, int queueSize)
         {
-            super(executorFactory
-                    .withJmxInternal()
-                    .configurePooled(name, threads)
-                    .withThreadGroup(compactionThreadGroup)
-                    .withQueueLimit(queueSize).build());
+            this.executor = executorFactory
+                             .withJmxInternal()
+                             .configurePooled(name, threads)
+                             .withThreadGroup(compactionThreadGroup)
+                             .withQueueLimit(queueSize)
+                             .build();
         }
 
         public Future<Void> submitIfRunning(Runnable task, String name)
@@ -2068,24 +2071,166 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
             }
         }
 
+        @Override
+        public void maybeExecuteImmediately(Runnable task)
+        {
+            executor.maybeExecuteImmediately(task);
+        }
+
+        @Override
+        public void execute(WithResources withResources, Runnable task)
+        {
+            executor.execute(withResources, task);
+        }
+
+        @Override
+        public <T> Future<T> submit(WithResources withResources, Callable<T> task)
+        {
+            return executor.submit(withResources, task);
+        }
+
+        @Override
+        public <T> Future<T> submit(WithResources withResources, Runnable task, T result)
+        {
+            return executor.submit(withResources, task, result);
+        }
+
+        @Override
+        public Future<?> submit(WithResources withResources, Runnable task)
+        {
+            return executor.submit(withResources, task);
+        }
+
+        @Override
+        public boolean inExecutor()
+        {
+            return executor.inExecutor();
+        }
+
+        @Override
         public void execute(Runnable command)
         {
             executor.execute(command);
         }
 
+        @Override
         public <T> Future<T> submit(Callable<T> task)
         {
             return executor.submit(task);
         }
 
+        @Override
         public <T> Future<T> submit(Runnable task, T result)
         {
             return submit(callable(task, result));
         }
 
+        @Override
         public Future<?> submit(Runnable task)
         {
             return submit(task, null);
+        }
+
+        @Override
+        public int getActiveTaskCount()
+        {
+            return executor.getActiveTaskCount();
+        }
+
+        @Override
+        public long getCompletedTaskCount()
+        {
+            return executor.getCompletedTaskCount();
+        }
+
+        @Override
+        public int getPendingTaskCount()
+        {
+            return executor.getPendingTaskCount();
+        }
+
+        @Override
+        public int getMaxTasksQueued()
+        {
+            return executor.getMaxTasksQueued();
+        }
+
+        @Override
+        public int getCorePoolSize()
+        {
+            return executor.getCorePoolSize();
+        }
+
+        @Override
+        public void setCorePoolSize(int newCorePoolSize)
+        {
+            executor.setCorePoolSize(newCorePoolSize);
+        }
+
+        @Override
+        public int getMaximumPoolSize()
+        {
+            return executor.getMaximumPoolSize();
+        }
+
+        @Override
+        public void setMaximumPoolSize(int newMaximumPoolSize)
+        {
+            executor.setMaximumPoolSize(newMaximumPoolSize);
+        }
+
+        @Override
+        public <T> List<java.util.concurrent.Future<T>> invokeAll(Collection<? extends Callable<T>> tasks) throws InterruptedException
+        {
+            return executor.invokeAll(tasks);
+        }
+
+        @Override
+        public <T> List<java.util.concurrent.Future<T>> invokeAll(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException
+        {
+            return executor.invokeAll(tasks, timeout, unit);
+        }
+
+        @Override
+        public <T> T invokeAny(Collection<? extends Callable<T>> tasks) throws InterruptedException, ExecutionException
+        {
+            return executor.invokeAny(tasks);
+        }
+
+        @Override
+        public <T> T invokeAny(Collection<? extends Callable<T>> tasks, long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException
+        {
+            return executor.invokeAny(tasks, timeout, unit);
+        }
+
+        @Override
+        public void shutdown()
+        {
+            executor.shutdown();
+        }
+
+        @Override
+        public List<Runnable> shutdownNow()
+        {
+            return executor.shutdownNow();
+        }
+
+        @Override
+        public boolean isShutdown()
+        {
+            return executor.isShutdown();
+        }
+
+        @Override
+        public boolean isTerminated()
+        {
+            return executor.isTerminated();
+        }
+
+        @Override
+        public boolean awaitTermination(long timeout, TimeUnit unit) throws InterruptedException
+        {
+            return executor.awaitTermination(timeout, unit);
         }
     }
 
