@@ -62,6 +62,7 @@ import org.slf4j.LoggerFactory;
 import net.openhft.chronicle.core.util.ThrowingSupplier;
 import org.apache.cassandra.cache.AutoSavingCache;
 import org.apache.cassandra.concurrent.ExecutorFactory;
+import org.apache.cassandra.concurrent.ExecutorPlus;
 import org.apache.cassandra.concurrent.WrappedExecutorPlus;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -158,13 +159,13 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
     private final CompactionExecutor executor = new CompactionExecutor();
     private final ValidationExecutor validationExecutor = new ValidationExecutor();
-    private final CompactionExecutor cacheCleanupExecutor = new CacheCleanupExecutor();
-    private final CompactionExecutor viewBuildExecutor = new ViewBuildExecutor();
+    private final CompactionExecutor cacheCleanupExecutor = CompactionExecutor.forCacheCleanup();
+    private final CompactionExecutor viewBuildExecutor = CompactionExecutor.forViewBuilder();
 
     // We can't house 2i builds in SecondaryIndexManagement because it could cause deadlocks with itself, and can cause
     // massive to indefinite pauses if prioritized either before or after normal compactions so we instead put it in its
     // own pool to prevent either scenario.
-    private final SecondaryIndexExecutor secondaryIndexExecutor = new SecondaryIndexExecutor();
+    private final CompactionExecutor secondaryIndexExecutor = CompactionExecutor.forSecondaryIndex();
 
     private final CompactionMetrics metrics = new CompactionMetrics(executor, validationExecutor, viewBuildExecutor, secondaryIndexExecutor);
 
@@ -2012,7 +2013,9 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         return thread.getThreadGroup().getParent() == compactionThreadGroup;
     }
 
-    // TODO: this is a bit ugly, but no uglier than it was
+    // The dedicated executor hierarchy keeps all compaction-adjacent thread pools under the same
+    // thread group so JMX accounting and debugging remain consistent even though the executors are
+    // configured slightly differently.
     static class CompactionExecutor extends WrappedExecutorPlus
     {
         static final ThreadGroup compactionThreadGroup = executorFactory().newThreadGroup("compaction");
@@ -2029,16 +2032,41 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
         protected CompactionExecutor(ExecutorFactory executorFactory, int threads, String name, int queueSize)
         {
-            super(executorFactory
-                    .withJmxInternal()
-                    .configurePooled(name, threads)
-                    .withThreadGroup(compactionThreadGroup)
-                    .withQueueLimit(queueSize).build());
+            super(buildExecutor(executorFactory, threads, name, queueSize));
+        }
+
+        private static ExecutorPlus buildExecutor(ExecutorFactory executorFactory, int threads, String name, int queueSize)
+        {
+            return executorFactory
+                   .withJmxInternal()
+                   .configurePooled(name, threads)
+                   .withThreadGroup(compactionThreadGroup)
+                   .withQueueLimit(queueSize)
+                   .build();
+        }
+
+        static CompactionExecutor forCacheCleanup()
+        {
+            return new CompactionExecutor(1, "CacheCleanupExecutor", Integer.MAX_VALUE);
+        }
+
+        static CompactionExecutor forViewBuilder()
+        {
+            return new CompactionExecutor(DatabaseDescriptor.getConcurrentViewBuilders(),
+                                           "ViewBuildExecutor",
+                                           Integer.MAX_VALUE);
+        }
+
+        static CompactionExecutor forSecondaryIndex()
+        {
+            return new CompactionExecutor(DatabaseDescriptor.getConcurrentIndexBuilders(),
+                                           "SecondaryIndexExecutor",
+                                           Integer.MAX_VALUE);
         }
 
         public Future<Void> submitIfRunning(Runnable task, String name)
         {
-            return submitIfRunning(callable(name, task), name);
+            return submitIfRunningInternal(callable(name, task), name);
         }
 
         /**
@@ -2052,6 +2080,11 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
          *         cancelled if the task could not be submitted.
          */
         public <T> Future<T> submitIfRunning(Callable<T> task, String name)
+        {
+            return submitIfRunningInternal(task, name);
+        }
+
+        private <T> Future<T> submitIfRunningInternal(Callable<T> task, String name)
         {
             try
             {
@@ -2118,21 +2151,6 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         }
     }
 
-    private static class ViewBuildExecutor extends CompactionExecutor
-    {
-        public ViewBuildExecutor()
-        {
-            super(DatabaseDescriptor.getConcurrentViewBuilders(), "ViewBuildExecutor", Integer.MAX_VALUE);
-        }
-    }
-
-    private static class CacheCleanupExecutor extends CompactionExecutor
-    {
-        public CacheCleanupExecutor()
-        {
-            super(1, "CacheCleanupExecutor", Integer.MAX_VALUE);
-        }
-    }
 
     public void incrementAborted()
     {
@@ -2149,13 +2167,7 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         metrics.sstablesDropppedFromCompactions.inc(num);
     }
 
-    private static class SecondaryIndexExecutor extends CompactionExecutor
-    {
-        public SecondaryIndexExecutor()
-        {
-            super(DatabaseDescriptor.getConcurrentIndexBuilders(), "SecondaryIndexExecutor", Integer.MAX_VALUE);
-        }
-    }
+    // ValidationExecutor keeps its own subclass purely to expose pool-resizing helpers that are repair-specific.
 
     @Override
     public List<Map<String, String>> getCompactions()
