@@ -208,14 +208,14 @@ public class CompactionStrategyManagerTest
         DatabaseDescriptor.setAutomaticSSTableUpgradeEnabled(true);
         DatabaseDescriptor.setMaxConcurrentAutoUpgradeTasks(1);
 
-        // latch to block CompactionManager.BackgroundCompactionCandidate#maybeRunUpgradeTask
+        // latch to block BackgroundCompactionCommand#maybeRunUpgradeTask
         // inside the currentlyBackgroundUpgrading check - with max_concurrent_auto_upgrade_tasks = 1 this will make
-        // sure that BackgroundCompactionCandidate#maybeRunUpgradeTask returns false until the latch has been counted down
+        // sure that BackgroundCompactionCommand#maybeRunUpgradeTask returns false until the latch has been counted down
         CountDownLatch latch = new CountDownLatch(1);
         AtomicInteger upgradeTaskCount = new AtomicInteger(0);
         MockCFSForCSM mock = new MockCFSForCSM(cfs, latch, upgradeTaskCount);
 
-        CompactionManager.BackgroundCompactionCandidate r = CompactionManager.instance.getBackgroundCompactionCandidate(mock);
+        BackgroundCompactionCommand r = CompactionManager.instance.getBackgroundCompactionCommand(mock);
         CompactionStrategyManager mgr = mock.getCompactionStrategyManager();
         // basic idea is that we start a thread which will be able to get in to the currentlyBackgroundUpgrading-guarded
         // code in CompactionManager, then we try to run a bunch more of the upgrade tasks which should return false
@@ -240,14 +240,14 @@ public class CompactionStrategyManagerTest
         ColumnFamilyStore cfs = Keyspace.open(KS_PREFIX).getColumnFamilyStore(TABLE_PREFIX);
         DatabaseDescriptor.setAutomaticSSTableUpgradeEnabled(true);
         DatabaseDescriptor.setMaxConcurrentAutoUpgradeTasks(2);
-        // latch to block CompactionManager.BackgroundCompactionCandidate#maybeRunUpgradeTask
+        // latch to block BackgroundCompactionCommand#maybeRunUpgradeTask
         // inside the currentlyBackgroundUpgrading check - with max_concurrent_auto_upgrade_tasks = 1 this will make
-        // sure that BackgroundCompactionCandidate#maybeRunUpgradeTask returns false until the latch has been counted down
+        // sure that BackgroundCompactionCommand#maybeRunUpgradeTask returns false until the latch has been counted down
         CountDownLatch latch = new CountDownLatch(1);
         AtomicInteger upgradeTaskCount = new AtomicInteger();
         MockCFSForCSM mock = new MockCFSForCSM(cfs, latch, upgradeTaskCount);
 
-        CompactionManager.BackgroundCompactionCandidate r = CompactionManager.instance.getBackgroundCompactionCandidate(mock);
+        BackgroundCompactionCommand r = CompactionManager.instance.getBackgroundCompactionCommand(mock);
         CompactionStrategyManager mgr = mock.getCompactionStrategyManager();
 
         // basic idea is that we start 2 threads who will be able to get in to the currentlyBackgroundUpgrading-guarded
