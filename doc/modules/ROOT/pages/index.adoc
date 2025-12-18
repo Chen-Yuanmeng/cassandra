@@ -52,3 +52,4 @@ If you would like to contribute to this documentation, you are welcome to do so 
 * xref:master@_:ROOT:docdev/index.adoc[Contributing to the docs]
 * xref:master@_:ROOT:community.adoc[Community]
 * xref:master@_:ROOT:download.adoc[Download]
+* xref:compaction_workflows.adoc[Compaction scheduling workflows]

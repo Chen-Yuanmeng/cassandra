@@ -1,0 +1,52 @@
+= Compaction Scheduling Workflows
+:description: Overview of the CompactionCommand / CompactionWorkScheduler abstractions.
+
+== Overview
+
+Cassandra 5.0 introduces a lightweight scheduling layer for the compaction subsystem. The new
+`CompactionCommand` / `CompactionWorkScheduler` pair separates decision making ("_should we run a
+compaction, and which one?_") from execution plumbing (threads, rate limiting, and
+`ActiveCompactions` tracking). This split reduces the size of `CompactionManager` and allows new
+compaction triggers to be added without duplicating wiring logic.
+
+== Key types
+
+`CompactionCommand`:: Encapsulates a single unit of work. Commands expose `prepare`, `execute`, and
+`shouldReschedule` hooks that CompactionManager drives. Commands are responsible for interacting
+with `ActiveCompactions`, acquiring any transactions, and releasing resources via `onCancelled()` if
+an executor rejects them.
+
+`AbstractCompactionCommand`:: Convenience base class that handles one-time `prepare`/`execute`
+semantics and requires subclasses to implement a single `run(ActiveCompactions)` template method.
+
+`CompactionWorkScheduler`:: Strategy interface invoked by `CompactionManager.submitBackground`. Each
+scheduler inspects the `CompactionContext` (which bundles the `ColumnFamilyStore`, GC horizon, rate
+limiter, etc.) and returns an optional command. Schedulers can short-circuit when their trigger is
+not applicable, allowing `CompactionManager` to compose multiple schedulers in priority order.
+
+`CompactionContext`:: Immutable carrier for shared dependencies passed to schedulers. The current
+context includes the target `ColumnFamilyStore`, reference to `CompactionManager`, the computed
+`gcBefore` timestamp, a `RateLimiter`, and an optional attachment for scheduler-specific metadata.
+
+== Background scheduling
+
+`BackgroundCompactionScheduler` mirrors the legacy autocompaction heuristics (respecting
+`concurrent_compactors`, `compactingCF` tracking, and automatic SSTable upgrade fallbacks) and emits a
+`BackgroundCompactionCommand`. The command wraps the existing
+`CompactionStrategyManager#getNextBackgroundTask` call, executes the returned `AbstractCompactionTask`,
+and reports whether another submission is needed via `shouldReschedule`.
+
+== Extending compaction scheduling
+
+1. Implement `CompactionWorkScheduler` for the new trigger (for example, shard maintenance or
+   validation pre-checks). Use the provided `CompactionContext` to calculate GC horizons or share
+   throttling state.
+2. Return a concrete `CompactionCommand` that performs the work. Prefer extending
+   `AbstractCompactionCommand` so lifecycle bookkeeping remains consistent.
+3. Register the scheduler in `CompactionManager` (either in the scheduler chain or via explicit
+   submission method) so it participates in the normal background loop.
+4. If the command acquires resources prior to execution, override `onCancelled()` to release them in
+   case the executor rejects the runnable.
+
+This structure keeps `CompactionManager` primarily focused on executor management and centralized
+metrics, while compaction policies evolve independently.
