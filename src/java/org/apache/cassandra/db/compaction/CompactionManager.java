@@ -27,6 +27,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
@@ -173,6 +174,8 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
     public final ActiveCompactions active = new ActiveCompactions();
 
+    private final CompactionWorkScheduler backgroundScheduler = new BackgroundCompactionScheduler(this);
+
     // used to temporarily pause non-strategy managed compactions (like index summary redistribution)
     private final AtomicInteger globalCompactionPauseCount = new AtomicInteger(0);
 
@@ -222,6 +225,26 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
             compactionRateLimiter.setRate(throughput);
     }
 
+    int getBackgroundSubmissionCount(ColumnFamilyStore cfs)
+    {
+        return compactingCF.count(cfs);
+    }
+
+    void trackBackgroundSubmission(ColumnFamilyStore cfs)
+    {
+        compactingCF.add(cfs);
+    }
+
+    void untrackBackgroundSubmission(ColumnFamilyStore cfs)
+    {
+        compactingCF.remove(cfs);
+    }
+
+    boolean isCompactionExecutorAtCapacity()
+    {
+        return executor.getActiveTaskCount() >= executor.getMaximumPoolSize();
+    }
+
     /**
      * Call this whenever a compaction might be needed on the given columnfamily.
      * It's okay to over-call (within reason) if a call is unnecessary, it will
@@ -229,38 +252,48 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
      */
     public List<Future<?>> submitBackground(final ColumnFamilyStore cfs)
     {
-        if (cfs.isAutoCompactionDisabled())
+        CompactionContext context = CompactionContext.builder(cfs)
+                                                     .withManager(this)
+                                                     .withGcBefore(getDefaultGcBefore(cfs, FBUtilities.nowInSeconds()))
+                                                     .withRateLimiter(getRateLimiter())
+                                                     .build();
+
+        Optional<CompactionCommand> commandOptional = backgroundScheduler.maybeBuild(cfs, context);
+        if (!commandOptional.isPresent())
+            return Collections.emptyList();
+
+        CompactionCommand command = commandOptional.get();
+        if (!command.prepare())
         {
-            logger.trace("Autocompaction is disabled");
+            command.onCancelled();
             return Collections.emptyList();
         }
-
-        /**
-         * If a CF is currently being compacted, and there are no idle threads, submitBackground should be a no-op;
-         * we can wait for the current compaction to finish and re-submit when more information is available.
-         * Otherwise, we should submit at least one task to prevent starvation by busier CFs, and more if there
-         * are idle threads stil. (CASSANDRA-4310)
-         */
-        int count = compactingCF.count(cfs);
-        if (count > 0 && executor.getActiveTaskCount() >= executor.getMaximumPoolSize())
-        {
-            logger.trace("Background compaction is still running for {}.{} ({} remaining). Skipping",
-                         cfs.getKeyspaceName(), cfs.name, count);
-            return Collections.emptyList();
-        }
-
-        logger.trace("Scheduling a background task check for {}.{} with {}",
-                     cfs.getKeyspaceName(),
-                     cfs.name,
-                     cfs.getCompactionStrategyManager().getName());
 
         List<Future<?>> futures = new ArrayList<>(1);
-        Future<?> fut = executor.submitIfRunning(new BackgroundCompactionCandidate(cfs), "background task");
+        Future<?> fut = executor.submitIfRunning(new CompactionCommandRunner(command), "background task");
         if (!fut.isCancelled())
             futures.add(fut);
         else
-            compactingCF.remove(cfs);
+            command.onCancelled();
         return futures;
+    }
+
+    private final class CompactionCommandRunner extends WrappedRunnable
+    {
+        private final CompactionCommand command;
+
+        private CompactionCommandRunner(CompactionCommand command)
+        {
+            this.command = command;
+        }
+
+        @Override
+        protected void runMayThrow() throws Exception
+        {
+            command.execute(active);
+            if (command.shouldReschedule())
+                submitBackground(command.getColumnFamilyStore());
+        }
     }
 
     public boolean isCompacting(Iterable<ColumnFamilyStore> cfses, Predicate<SSTableReader> sstablePredicate)
@@ -337,80 +370,15 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         executor.awaitTermination(timeout, unit);
     }
 
-    // the actual sstables to compact are not determined until we run the BCT; that way, if new sstables
-    // are created between task submission and execution, we execute against the most up-to-date information
     @VisibleForTesting
-    class BackgroundCompactionCandidate implements Runnable
+    BackgroundCompactionCommand getBackgroundCompactionCommand(ColumnFamilyStore cfs)
     {
-        private final ColumnFamilyStore cfs;
-
-        BackgroundCompactionCandidate(ColumnFamilyStore cfs)
-        {
-            compactingCF.add(cfs);
-            this.cfs = cfs;
-        }
-
-        public void run()
-        {
-            boolean ranCompaction = false;
-            try
-            {
-                logger.trace("Checking {}.{}", cfs.getKeyspaceName(), cfs.name);
-                if (!cfs.isValid())
-                {
-                    logger.trace("Aborting compaction for dropped CF");
-                    return;
-                }
-
-                CompactionStrategyManager strategy = cfs.getCompactionStrategyManager();
-                AbstractCompactionTask task = strategy.getNextBackgroundTask(getDefaultGcBefore(cfs, FBUtilities.nowInSeconds()));
-                if (task == null)
-                {
-                    if (DatabaseDescriptor.automaticSSTableUpgrade())
-                        ranCompaction = maybeRunUpgradeTask(strategy);
-                }
-                else
-                {
-                    task.execute(active);
-                    ranCompaction = true;
-                }
-            }
-            finally
-            {
-                compactingCF.remove(cfs);
-            }
-            if (ranCompaction) // only submit background if we actually ran a compaction - otherwise we end up in an infinite loop submitting noop background tasks
-                submitBackground(cfs);
-        }
-
-        boolean maybeRunUpgradeTask(CompactionStrategyManager strategy)
-        {
-            logger.debug("Checking for upgrade tasks {}.{}", cfs.getKeyspaceName(), cfs.getTableName());
-            try
-            {
-                if (currentlyBackgroundUpgrading.incrementAndGet() <= DatabaseDescriptor.maxConcurrentAutoUpgradeTasks())
-                {
-                    AbstractCompactionTask upgradeTask = strategy.findUpgradeSSTableTask();
-                    if (upgradeTask != null)
-                    {
-                        upgradeTask.execute(active);
-                        return true;
-                    }
-                }
-            }
-            finally
-            {
-                currentlyBackgroundUpgrading.decrementAndGet();
-            }
-            logger.trace("No tasks available");
-            return false;
-        }
-    }
-
-    @VisibleForTesting
-    public BackgroundCompactionCandidate getBackgroundCompactionCandidate(ColumnFamilyStore cfs)
-    {
-        return new BackgroundCompactionCandidate(cfs);
+        CompactionContext context = CompactionContext.builder(cfs)
+                                                     .withManager(this)
+                                                     .withGcBefore(getDefaultGcBefore(cfs, FBUtilities.nowInSeconds()))
+                                                     .withRateLimiter(getRateLimiter())
+                                                     .build();
+        return new BackgroundCompactionCommand(context, this);
     }
 
     /**
