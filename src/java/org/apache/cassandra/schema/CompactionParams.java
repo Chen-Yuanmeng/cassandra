@@ -35,6 +35,7 @@ import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
 import org.apache.cassandra.db.compaction.LeveledCompactionStrategy;
 import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
+import org.apache.cassandra.db.compaction.TTLAwareCompactionStrategy;
 import org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy;
 import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -157,6 +158,11 @@ public final class CompactionParams
     public static CompactionParams ucs(Map<String, String> options)
     {
         return create(UnifiedCompactionStrategy.class, options);
+    }
+
+    public static CompactionParams ttla(Map<String, String> options)
+    {
+        return create(TTLAwareCompactionStrategy.class, options);
     }
 
     public static CompactionParams twcs(Map<String, String> options)
