@@ -1206,11 +1206,13 @@ column_index_cache_size: 2KiB
 # If no value is specified, the default is to use SizeTieredCompactionStrategy,
 # with its default compaction parameters.
 #
-# default_compaction:
-#   class_name: SizeTieredCompactionStrategy
-#   parameters:
-#     min_threshold: 4
-#     max_threshold: 32
+default_compaction:
+  class_name: TTLAwareCompactionStrategy
+  parameters:
+    alpha: 0.8
+    beta: 0.7
+    ttl_horizon_seconds: 30
+    age_horizon_seconds: 5
 
 
 # Number of simultaneous compactions to allow, NOT including
